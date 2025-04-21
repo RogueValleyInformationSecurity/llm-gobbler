@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
@@ -16,6 +17,7 @@ use glob::{glob, Pattern};
 use log::{debug, error, info, warn, LevelFilter, Log, Metadata, Record, SetLoggerError};
 use memmap2::MmapOptions;
 use rand::rngs::OsRng;
+use arboard::Clipboard;
 
 #[cfg(test)]
 mod tests;
@@ -192,6 +194,8 @@ struct ScrapeConfig {
     use_signature: bool,
     keypair: Option<Keypair>,
     public_key: Option<PublicKey>,
+    // Clipboard mode: copy selected files to clipboard instead of writing output file
+    clipboard: bool,
 }
 
 // Implement a custom clone method that doesn't clone the non-cloneable fields
@@ -223,6 +227,7 @@ impl ScrapeConfig {
             use_signature: self.use_signature,
             keypair: None, // Don't clone the keypair
             public_key: new_public_key,
+            clipboard: self.clipboard,
         }
     }
 }
@@ -255,6 +260,7 @@ impl Default for ScrapeConfig {
             use_signature: false,
             keypair: None,
             public_key: None,
+            clipboard: false,
         }
     }
 }
@@ -444,6 +450,7 @@ fn print_usage(program_name: &str) {
     println!("  -e             Abort on errors (default is to continue)");
     println!("  -v             Verbose output");
     println!("  -q             Quiet mode (suppress all output)");
+    println!("  -c             Copy all chosen files to the clipboard (no output file)");
     println!("  -h             Show this help message");
     println!("  --signature    Add ed25519 signatures to files when globbing and verify signatures when unglobbing");
     println!("  --git PATH     Process a git repository (auto-configures path, name, and files)");
@@ -552,10 +559,16 @@ fn is_allowed_file_type(config: &ScrapeConfig, file_path: &str) -> bool {
         })
 }
 
+#[cfg(unix)]
 fn set_secure_file_permissions(path: &PathBuf) -> Result<(), String> {
     let permissions = fs::Permissions::from_mode(0o600);
     fs::set_permissions(path, permissions)
         .map_err(|e| format!("Failed to set permissions: {}", e))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_secure_file_permissions(_path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
@@ -1289,6 +1302,12 @@ fn main() -> Result<(), String> {
                 .help("Quiet mode (suppress all output)"),
         )
         .arg(
+            Arg::with_name("clipboard")
+                .short('c')
+                .long("clipboard")
+                .help("Copy all chosen files to the clipboard (no output file)"),
+        )
+        .arg(
             Arg::with_name("help")
                 .short('h')
                 .long("help")
@@ -1320,6 +1339,12 @@ fn main() -> Result<(), String> {
     }
 
     let mut config = ScrapeConfig::default();
+    // If clipboard mode is requested, enable clipboard and suppress file output and logs
+    if matches.is_present("clipboard") {
+        config.clipboard = true;
+        config.quiet = true;
+        set_quiet_mode(true);
+    }
 
     // Handle git repository option
     if let Some(git_path) = matches.value_of("git_repo") {
@@ -1365,6 +1390,8 @@ fn main() -> Result<(), String> {
         if let Some(output_filename) = matches.value_of("output_name") {
             config.output_filename = output_filename.to_string();
         }
+    } else if config.clipboard {
+        // Clipboard mode - skip output file setup
     } else {
         // Standard mode - require output path and filename
         let output_path = matches
@@ -1529,7 +1556,11 @@ fn main() -> Result<(), String> {
     if config.file_entries.is_empty() {
         return Err("Error: No files found matching criteria".to_string());
     }
-
+    // Clipboard mode: copy selected files and exit
+    if config.clipboard {
+        return clipboard_action(&config);
+    }
+    
     match run_scraper(&mut config) {
         Ok(output_file) => {
             if matches.is_present("verbose") {
@@ -1543,6 +1574,63 @@ fn main() -> Result<(), String> {
             Err(err)
         }
     }
+}
+// Copy selected files to clipboard instead of writing to a file
+// Uses arboard crate for cross-platform clipboard access
+fn clipboard_action(config: &ScrapeConfig) -> Result<(), String> {
+    use std::fs;
+    use std::str;
+    // Build output in a string buffer
+    let mut output = String::new();
+
+    // Write public key header if signature mode is enabled
+    if config.use_signature {
+        if let Some(public_key) = &config.public_key {
+            let encoded_pubkey = general_purpose::STANDARD.encode(public_key.to_bytes());
+            output.push_str(&format!("'''--- PUBLIC_KEY --- [KEY:{}]\n", encoded_pubkey));
+            output.push_str("'''\n\n");
+        }
+    }
+
+    // Process each selected file
+    for entry in &config.file_entries {
+        let file_path = &entry.path;
+        // Read file data
+        let data = fs::read(file_path)
+            .map_err(|e| format!("Failed to read file {}: {}", file_path, e))?;
+        let is_binary = is_binary_data(&data);
+
+        // Write file header with optional signature
+        if config.use_signature && !is_binary {
+            if let Some(keypair) = &config.keypair {
+                let signature = sign_data(keypair, &data);
+                output.push_str(&format!("'''--- {} --- [SIGNATURE:{}]\n", file_path, signature));
+            } else {
+                output.push_str(&format!("'''--- {} ---\n", file_path));
+            }
+        } else {
+            output.push_str(&format!("'''--- {} ---\n", file_path));
+        }
+
+        // Write file content or binary placeholder
+        if is_binary {
+            output.push_str("[Binary file - contents omitted]\n\n");
+        } else {
+            if !data.is_empty() {
+                let content_str = str::from_utf8(&data).unwrap_or("Non-UTF8 content");
+                output.push_str(content_str);
+            }
+            // Closing marker and spacing
+            output.push_str("\n'''\n\n");
+        }
+    }
+
+    // Copy assembled output to clipboard
+    let mut clipboard = Clipboard::new()
+        .map_err(|e| format!("Failed to initialize clipboard: {}", e))?;
+    clipboard.set_text(output)
+        .map_err(|e| format!("Failed to set clipboard text: {}", e))?;
+    Ok(())
 }
 // Generate a new keypair for signing
 fn generate_keypair() -> Keypair {
